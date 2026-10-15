@@ -30,6 +30,12 @@ let sensorState = "idle";
 let toastTimer = 0;
 let armClear = false;
 const charts = {};
+let mqttClient = null;
+let mqttState = "off";
+let lastMqttData = 0;
+let liveT = null;
+let lastCommitT = 0;
+let thermalFrame = null;
 
 function defaultSettings() {
   return {
@@ -38,6 +44,14 @@ function defaultSettings() {
     area: 1.7,
     endpoint: "",
     interval: 15,
+    mqttUrl: "",
+    mqttTopic: "",
+    mqttUser: "",
+    mqttPass: "",
+    thermalMirror: false,
+    sbUrl: "",
+    sbKey: "",
+    sbDevice: "",
   };
 }
 
@@ -190,7 +204,7 @@ function energyWh(readings) {
   return wh;
 }
 
-function inRange(readings, key, now = Date.now()) {
+function inRange(readings, key, now = clockNow()) {
   if (key === "all") return readings.filter((r) => r.t <= now + 60000);
   let from = now - 7 * 86400000;
   if (key === "today") {
@@ -297,7 +311,7 @@ function dailyEnergy(readings) {
 }
 
 function energyUntilSameHour(readings, dayOffset) {
-  const now = new Date();
+  const now = new Date(clockNow());
   const start = new Date(now);
   start.setDate(now.getDate() + dayOffset);
   start.setHours(0, 0, 0, 0);
@@ -311,7 +325,7 @@ function buildInsights(all, viewed) {
   if (!viewed.length) return ["Todavía no hay mediciones en este periodo."];
   const notes = [];
   const area = state.settings.area;
-  const todayStart = startOfDay(Date.now());
+  const todayStart = startOfDay(clockNow());
   const today = all.filter((r) => r.t >= todayStart);
   const eToday = energyWh(today);
   const eYday = energyUntilSameHour(all, -1);
@@ -766,7 +780,8 @@ function renderSpark(id, values, color) {
 }
 
 function render() {
-  const all = state.readings;
+  if (cloudActive() && !sim.active && cloud.range !== viewRange()) loadCloud();
+  const all = readingsSource();
   const viewed = inRange(all, viewRange());
   const latest = all[all.length - 1] || null;
   const prev = all.length > 1 ? all[all.length - 2] : null;
@@ -774,13 +789,17 @@ function render() {
   renderKpis(latest, viewed);
   renderEnergyCard(latest, viewed);
   renderInsights(all, viewed);
+  renderVitals(latest, all);
   renderCharts(viewed);
   renderTable(viewed);
   renderBanner();
   renderStatus();
   document.getElementById("foot-count").textContent = all.length
-    ? `${all.length.toLocaleString("es-MX")} lecturas guardadas`
+    ? `${all.length.toLocaleString("es-MX")} ${cloudActive() && !sim.active ? "puntos del historial en la nube" : "lecturas guardadas"}`
     : "Sin lecturas guardadas";
+  document.getElementById("foot-note").textContent = cloudActive() && !sim.active
+    ? "El historial vive en Supabase. Exportar descarga el registro completo, sin promediar."
+    : "Las lecturas se guardan en este navegador. Exporta un CSV para no perderlas.";
   document.querySelectorAll(".kpi[data-metric]").forEach((card) => {
     const on = card.dataset.metric === metric;
     card.classList.toggle("is-on", on);
@@ -852,6 +871,111 @@ function renderEnergyCard(latest, viewed) {
   document.getElementById("energy-sub").textContent = span === "day"
     ? "Energía estimada de hoy"
     : "Energía estimada del periodo";
+  renderEnergyBars(viewed);
+}
+
+// Reparte la energía de cada tramo entre lecturas según la hora (o día) de su punto medio
+function energyBuckets(readings, keyOf) {
+  const map = new Map();
+  for (let k = 1; k < readings.length; k += 1) {
+    const a = readings[k - 1];
+    const b = readings[k];
+    const dt = (b.t - a.t) / 3600000;
+    if (dt <= 0 || dt > MAX_GAP_H) continue;
+    const key = keyOf((a.t + b.t) / 2);
+    map.set(key, (map.get(key) || 0) + ((powerOf(a) + powerOf(b)) / 2) * dt);
+  }
+  return map;
+}
+
+function renderEnergyBars(viewed) {
+  const box = document.getElementById("energy-bars");
+  const caption = document.getElementById("energy-bars-caption");
+  const days = new Set(viewed.map((r) => dayKey(r.t)));
+  const bars = [];
+  const hh = (n) => String(n).padStart(2, "0");
+  if (span === "day" || days.size < 2) {
+    const ref = viewed.length ? viewed[viewed.length - 1].t : clockNow();
+    const start = startOfDay(ref);
+    const sameDay = viewed.filter((r) => r.t >= start && r.t < start + 86400000);
+    const byHour = energyBuckets(sameDay, (t) => new Date(t).getHours());
+    const nowHour = new Date(ref).getHours();
+    for (let hour = 6; hour <= 19; hour += 1) {
+      bars.push({
+        wh: byHour.get(hour) || 0,
+        label: hour % 3 === 0 ? hh(hour) : "",
+        title: `${hh(hour)}:00 a ${hh(hour + 1)}:00`,
+        now: hour === nowHour,
+      });
+    }
+    caption.textContent = "Energía por hora";
+  } else {
+    const byDay = energyBuckets(viewed, dayKey);
+    const letters = ["D", "L", "M", "X", "J", "V", "S"];
+    const last = new Date(startOfDay(viewed[viewed.length - 1].t));
+    const count = periodRange === "48h" ? 3 : 7;
+    for (let k = count - 1; k >= 0; k -= 1) {
+      const d = new Date(last);
+      d.setDate(last.getDate() - k);
+      bars.push({ wh: byDay.get(dayKey(d.getTime())) || 0, label: letters[d.getDay()], title: fmtDay.format(d), now: k === 0 });
+    }
+    caption.textContent = "Energía por día";
+  }
+  const max = Math.max(...bars.map((b) => b.wh), 0.0001);
+  box.replaceChildren(...bars.map((b) => {
+    const el = document.createElement("div");
+    el.className = b.now ? "ebar now" : "ebar";
+    const energy = formatEnergy(b.wh);
+    el.title = `${b.title}: ${energy.value} ${energy.unit}`;
+    const bar = document.createElement("i");
+    bar.style.setProperty("--h", `${(b.wh / max) * 100}%`);
+    const label = document.createElement("span");
+    label.textContent = b.label;
+    el.append(bar, label);
+    return el;
+  }));
+}
+
+function renderVitals(latest, all) {
+  const area = state.settings.area;
+  const eff = latest ? efficiencyOf(latest, area) : null;
+  const perArea = latest ? powerOf(latest) / area : null;
+  const dT = latest && latest.tp != null && latest.ta != null ? latest.tp - latest.ta : null;
+  const ref = latest ? latest.t : clockNow();
+  const start = startOfDay(ref);
+  const today = all.filter((r) => r.t >= start && r.t <= ref);
+  let irrWh = 0;
+  let hasIrr = false;
+  for (let k = 1; k < today.length; k += 1) {
+    const a = today[k - 1];
+    const b = today[k];
+    const dt = (b.t - a.t) / 3600000;
+    if (a.irr == null || b.irr == null || dt <= 0 || dt > MAX_GAP_H) continue;
+    irrWh += ((a.irr + b.irr) / 2) * dt;
+    hasIrr = true;
+  }
+  const items = [
+    ["Eficiencia", eff == null ? "—" : `${fmt(eff, 1)} %`,
+      eff == null ? "Se calcula con más de 50 W/m² de luz" : "De la luz que llega, cuánta sale como electricidad"],
+    ["Potencia por m²", perArea == null ? "—" : `${fmt(perArea, perArea >= 100 ? 0 : 1)} W/m²`,
+      `Sobre ${fmt(area, 2)} m² de panel`],
+    ["Panel contra aire", dT == null ? "—" : `${dT >= 0 ? "+" : "−"}${fmt(Math.abs(dT), 1)} °C`,
+      dT != null && dT > 30 ? "Muy caliente: el voltaje cae" : "Cuánto se calienta sobre el ambiente"],
+    ["Horas de sol pico", hasIrr ? `${fmt(irrWh / 1000, 1)} h` : "—",
+      "Hoy, contadas como horas a 1000 W/m²"],
+  ];
+  document.getElementById("vitals").replaceChildren(...items.map(([label, value, note]) => {
+    const el = document.createElement("div");
+    el.className = "vital";
+    const a = document.createElement("span");
+    a.textContent = label;
+    const b = document.createElement("strong");
+    b.textContent = value;
+    const c = document.createElement("small");
+    c.textContent = note;
+    el.append(a, b, c);
+    return el;
+  }));
 }
 
 function renderInsights(all, viewed) {
@@ -1061,8 +1185,9 @@ function renderTable(viewed) {
   document.getElementById("table-meta").textContent = rows.length
     ? `${rows.length.toLocaleString("es-MX")} en este periodo, de la más reciente a la más antigua`
     : "Nada en este periodo";
+  const hasWind = readingsSource().some((r) => r.wind != null);
   document.querySelectorAll(".wind-col").forEach((cell) => {
-    cell.hidden = !state.readings.some((r) => r.wind != null);
+    cell.hidden = !hasWind;
   });
   body.replaceChildren();
   if (!visible.length) {
@@ -1093,7 +1218,7 @@ function renderTable(viewed) {
       if (index === 0) td.className = "when";
       if (index === 8) {
         td.className = "wind-col";
-        td.hidden = !state.readings.some((r) => r.wind != null);
+        td.hidden = !hasWind;
       }
       td.textContent = text;
       tr.appendChild(td);
@@ -1104,6 +1229,22 @@ function renderTable(viewed) {
 
 function renderBanner() {
   const banner = document.getElementById("banner");
+  if (sim.active) {
+    banner.hidden = true;
+    return;
+  }
+  if (cloudActive()) {
+    if (cloud.error) {
+      banner.hidden = false;
+      banner.textContent = `No pude leer el historial de Supabase: ${cloud.error}. Revisa la URL, la clave pública y el dispositivo en ajustes.`;
+    } else if (cloud.range && !cloud.readings.length) {
+      banner.hidden = false;
+      banner.textContent = `Supabase está conectado, pero todavía no hay lecturas de «${state.settings.sbDevice}» en este periodo.`;
+    } else {
+      banner.hidden = true;
+    }
+    return;
+  }
   if (state.mode === "demo") {
     banner.hidden = false;
     banner.textContent = `Estás viendo una simulación de cinco días para un módulo de ${fmt(state.settings.area, 2)} m². Sirve para recorrer el tablero. Al registrar una medición, importar un CSV o recibir datos del sensor, la simulación se reemplaza.`;
@@ -1120,7 +1261,26 @@ function renderBanner() {
 function renderStatus() {
   const status = document.getElementById("status");
   const text = document.getElementById("status-text");
-  status.classList.remove("ok", "warn");
+  status.classList.remove("ok", "warn", "sim");
+  if (sim.active) {
+    status.classList.add("sim");
+    text.textContent = sim.playing ? "Simulación en vivo" : "Simulación en pausa";
+    return;
+  }
+  if (mqttState !== "off") {
+    const labels = {
+      connecting: ["warn", "Conectando al broker"],
+      waiting: ["", "Broker conectado, esperando al ESP32"],
+      ok: ["ok", "ESP32 en línea (MQTT)"],
+      stale: ["warn", "ESP32 sin datos recientes"],
+      offline: ["warn", "ESP32 desconectado"],
+      error: ["warn", "No pude conectar al broker"],
+    };
+    const [cls, label] = labels[mqttState] || ["", "MQTT"];
+    if (cls) status.classList.add(cls);
+    text.textContent = label;
+    return;
+  }
   if (sensorState === "ok") {
     status.classList.add("ok");
     text.textContent = "Sensor en línea";
@@ -1307,6 +1467,10 @@ function download(filename, text) {
 }
 
 function exportCSV() {
+  if (cloudActive() && !sim.active) {
+    exportCloudCSV().catch((error) => toast(error.message || "No pude descargar el registro."));
+    return;
+  }
   if (!state.readings.length) {
     toast("No hay lecturas para exportar.");
     return;
@@ -1393,6 +1557,13 @@ function openSettings() {
   document.getElementById("set-area").value = state.settings.area;
   document.getElementById("set-endpoint").value = state.settings.endpoint;
   document.getElementById("set-interval").value = state.settings.interval;
+  document.getElementById("set-mqtt-url").value = state.settings.mqttUrl;
+  document.getElementById("set-mqtt-topic").value = state.settings.mqttTopic;
+  document.getElementById("set-mqtt-user").value = state.settings.mqttUser;
+  document.getElementById("set-mqtt-pass").value = state.settings.mqttPass;
+  document.getElementById("set-sb-url").value = state.settings.sbUrl;
+  document.getElementById("set-sb-key").value = state.settings.sbKey;
+  document.getElementById("set-sb-device").value = state.settings.sbDevice || defaultDevice(state.settings.mqttTopic);
   document.getElementById("dlg-settings").showModal();
 }
 
@@ -1436,6 +1607,697 @@ function applyPoll() {
   }
   pollSensor();
   pollTimer = setInterval(pollSensor, state.settings.interval * 1000);
+}
+
+// ---------- Simulador en vivo ----------
+// Genera lecturas y cuadros térmicos con un modelo físico sencillo. Vive solo en memoria:
+// nunca toca state.readings, así el historial real queda intacto.
+const SIM_FIRST_MIN = 5 * 60 + 30;
+const SIM_LAST_MIN = 20 * 60 + 30;
+const SIM_PRESETS = {
+  clear: { cloud: 5, ta: 30, dirt: 0, wind: 1.5, shade: false, hotspot: false },
+  cloudy: { cloud: 78, ta: 23, dirt: 0, wind: 3.5, shade: false, hotspot: false },
+  heat: { cloud: 0, ta: 42, dirt: 0, wind: 0.5, shade: false, hotspot: false },
+  dirty: { cloud: 10, ta: 31, dirt: 28, wind: 1, shade: true, hotspot: true },
+};
+const sim = {
+  active: false,
+  playing: true,
+  speed: 60,
+  t: 0,
+  readings: [],
+  frame: null,
+  timer: null,
+  dragging: false,
+  prevSpan: "period",
+  params: { ...SIM_PRESETS.clear },
+};
+
+function clockNow() {
+  return sim.active ? sim.t : Date.now();
+}
+
+function readingsSource() {
+  if (sim.active) return sim.readings;
+  return cloudActive() ? cloud.readings : state.readings;
+}
+
+function simDayAt(minutes) {
+  return startOfDay(Date.now()) + minutes * 60000;
+}
+
+function minutesOfDay(t) {
+  const d = new Date(t);
+  return d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60;
+}
+
+function simSun(t) {
+  const x = (minutesOfDay(t) / 60 - SOLAR_RISE) / (SOLAR_SET - SOLAR_RISE);
+  return x <= 0 || x >= 1 ? 0 : Math.sin(Math.PI * x) ** 1.2;
+}
+
+// Nubes que pasan: ruido suave que depende del tiempo simulado
+function simCloudTransmission(t, cloud) {
+  if (cloud <= 0) return 1;
+  const m = t / 60000;
+  const n = 0.5 + 0.25 * Math.sin(m / 9) + 0.25 * Math.sin(m / 23 + 1.7) * Math.sin(m / 4.3 + 0.4);
+  const c = cloud / 100;
+  return clamp(1 - c * (0.2 + 0.7 * n) - c * c * 0.08, 0.05, 1);
+}
+
+// Irradiancia → temperatura de celda (modelo NOCT con viento) → punto de máxima potencia
+function simModel(t) {
+  const p = sim.params;
+  const sun = simSun(t);
+  const ghi = 1040 * sun * simCloudTransmission(t, p.cloud);
+  const ta = p.ta - 7 * (1 - sun) - (p.cloud / 100) * 2;
+  const geff = ghi * (1 - p.dirt / 100);
+  const tc = ta + 0.03125 * ghi * (9.5 / (5.7 + 3.8 * p.wind));
+  const area = state.settings.area;
+  const cells = area < 0.3 ? 12 : 60;
+  const vmpStc = cells * 0.55;
+  const impStc = (area * 1000 * 0.2) / vmpStc;
+  const kTemp = 1 - 0.0037 * (tc - 25);
+  const kLow = geff > 2 ? clamp(1 + 0.045 * Math.log(geff / 1000), 0.5, 1.03) : 0;
+  // Con sombra, el diodo de bypass saca de juego un tercio de las celdas
+  const kShade = p.shade ? 2 / 3 : 1;
+  const kCell = p.hotspot ? 0.94 : 1;
+  return {
+    sun, ghi, geff, ta, tc, kTemp, kLow, kShade, kCell,
+    v: vmpStc * kTemp * kLow * kShade,
+    i: impStc * (geff / 1000) * (1 + 0.0005 * (tc - 25)) * kCell,
+    pIdeal: area * ghi * 0.2,
+  };
+}
+
+function simSample(t) {
+  const m = simModel(t);
+  const p = sim.params;
+  const jitter = (amount) => 1 + (Math.random() - 0.5) * amount;
+  return {
+    t,
+    v: Math.max(0, m.v * jitter(0.006)),
+    i: Math.max(0, m.i * jitter(0.01)),
+    irr: Math.round(m.ghi * jitter(0.01)),
+    tp: roundTo(m.tc + (Math.random() - 0.5) * 0.3, 1),
+    ta: roundTo(m.ta + (Math.random() - 0.5) * 0.2, 1),
+    h: Math.round(clamp(72 - 38 * m.sun + p.cloud * 0.22, 12, 98)),
+    wind: roundTo(Math.max(0, p.wind * jitter(0.5)), 1),
+  };
+}
+
+// Cuadro de 32×24 como el de la MLX90640: cielo arriba, suelo abajo y el panel en medio
+function simFrame(t) {
+  const m = simModel(t);
+  const p = sim.params;
+  const w = 32;
+  const h = 24;
+  const x0 = 1;
+  const x1 = 30;
+  const y0 = 3;
+  const y1 = 21;
+  const cellW = (x1 - x0 + 1) / 6;
+  const cellH = (y1 - y0 + 1) / 4;
+  const hotX = x0 + cellW * 1.5;
+  const hotY = y0 + cellH * 1.5;
+  const shadeFrom = x0 + (x1 - x0 + 1) * (2 / 3);
+  const temps = new Array(w * h);
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      let k;
+      if (y < y0) k = m.ta - 4 - 6 * (1 - p.cloud / 100) + y * 0.6;
+      else if (y > y1) k = m.ta + 2 + 9 * m.sun;
+      else if (x < x0 || x > x1) k = m.ta + 1 + 3 * m.sun;
+      else {
+        k = m.tc;
+        const edge = x === x0 || x === x1 || y === y0 || y === y1;
+        const gap = (x - x0) % cellW < 0.5 || (y - y0) % cellH < 0.5;
+        if (edge) k = m.ta + (m.tc - m.ta) * 0.55;
+        else if (gap) k -= 0.7;
+        if (p.shade && x >= shadeFrom) k = m.ta + (k - m.ta) * 0.4;
+        if (p.dirt) k += (p.dirt / 100) * 4 * (0.5 + 0.5 * Math.sin(x * 1.7 + y * 0.9) * Math.cos(y * 1.3 - x * 0.4));
+        if (p.hotspot) {
+          const d = Math.hypot(((x - hotX) / cellW) * 2, ((y - hotY) / cellH) * 2);
+          if (d < 1.6) k += (5 + 17 * (m.geff / 1000)) * Math.exp(-d * d);
+        }
+      }
+      temps[y * w + x] = k + (Math.random() - 0.5) * 0.4;
+    }
+  }
+  return { w, h, temps, ...thermalStats(temps), at: t };
+}
+
+// Lleva el reloj simulado a `target`; rellena huecos cada 5 min para que la curva no se corte
+function simAdvanceTo(target) {
+  const list = sim.readings;
+  while (list.length && list[list.length - 1].t >= target) list.pop();
+  const step = 5 * 60000;
+  let t = list.length ? list[list.length - 1].t : simDayAt(SIM_FIRST_MIN) - step;
+  while (target - t > step) {
+    t += step;
+    list.push(simSample(t));
+  }
+  list.push(simSample(target));
+  if (list.length > 20000) list.splice(0, list.length - 20000);
+  sim.t = target;
+  sim.frame = simFrame(target);
+}
+
+function simRefresh() {
+  render();
+  renderThermal();
+  renderSim();
+}
+
+function simTick() {
+  if (!sim.active || !sim.playing || sim.dragging) return;
+  const end = simDayAt(SIM_LAST_MIN);
+  const next = sim.t + sim.speed * 1000;
+  if (next >= end) {
+    simAdvanceTo(end);
+    sim.playing = false;
+    simRefresh();
+    toast("Terminó el día simulado. Dale play para empezar otro.");
+    return;
+  }
+  simAdvanceTo(next);
+  simRefresh();
+}
+
+function startSim() {
+  if (sim.active) return;
+  sim.active = true;
+  sim.playing = true;
+  sim.readings = [];
+  sim.prevSpan = span;
+  span = "day";
+  tableExpanded = false;
+  simAdvanceTo(simDayAt(11 * 60));
+  clearInterval(sim.timer);
+  sim.timer = setInterval(simTick, 1000);
+  document.body.classList.add("sim-on");
+  document.getElementById("sim-panel").hidden = false;
+  document.getElementById("btn-sim").setAttribute("aria-pressed", "true");
+  syncSimControls();
+  simRefresh();
+  document.getElementById("sim-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function stopSim() {
+  if (!sim.active) return;
+  clearInterval(sim.timer);
+  sim.timer = null;
+  sim.active = false;
+  sim.readings = [];
+  sim.frame = null;
+  span = sim.prevSpan;
+  tableExpanded = false;
+  document.body.classList.remove("sim-on");
+  document.getElementById("sim-panel").hidden = true;
+  document.getElementById("btn-sim").setAttribute("aria-pressed", "false");
+  render();
+  renderThermal();
+  toast("Saliste del simulador. Volviste a tus datos reales.");
+}
+
+function setFill(input) {
+  const pct = ((Number(input.value) - Number(input.min)) / (Number(input.max) - Number(input.min))) * 100;
+  input.style.setProperty("--fill", `${pct}%`);
+}
+
+const SIM_SLIDERS = [
+  ["cloud", (v) => `${fmt(v, 0)} %`],
+  ["ta", (v) => `${fmt(v, 0)} °C`],
+  ["dirt", (v) => `${fmt(v, 0)} %`],
+  ["wind", (v) => `${fmt(v, 1)} m/s`],
+];
+
+function syncSimControls() {
+  SIM_SLIDERS.forEach(([key, label]) => {
+    const input = document.getElementById(`sim-${key}`);
+    input.value = sim.params[key];
+    document.getElementById(`out-${key}`).textContent = label(sim.params[key]);
+    setFill(input);
+  });
+  document.getElementById("sim-shade").checked = sim.params.shade;
+  document.getElementById("sim-hotspot").checked = sim.params.hotspot;
+  document.querySelectorAll("[data-speed]").forEach((button) => {
+    button.classList.toggle("active", Number(button.dataset.speed) === sim.speed);
+  });
+}
+
+function skyLabel(t) {
+  if (simSun(t) <= 0) return "Noche";
+  const trans = simCloudTransmission(t, sim.params.cloud);
+  if (trans > 0.85) return "Despejado";
+  if (trans > 0.6) return "Parcialmente nublado";
+  if (trans > 0.35) return "Nublado";
+  return "Muy nublado";
+}
+
+function renderSim() {
+  if (!sim.active) return;
+  const minutes = minutesOfDay(sim.t);
+  document.getElementById("sim-time").textContent = fmtTime.format(sim.t);
+  document.getElementById("sim-sky").textContent = skyLabel(sim.t);
+  const hour = document.getElementById("sim-hour");
+  if (!sim.dragging) hour.value = Math.round(minutes);
+
+  const x = (minutes / 60 - SOLAR_RISE) / (SOLAR_SET - SOLAR_RISE);
+  const progress = clamp(x, 0, 1);
+  const angle = Math.PI * (1 - progress);
+  const sunDot = document.getElementById("sim-sun");
+  sunDot.setAttribute("cx", (66 + 58 * Math.cos(angle)).toFixed(1));
+  sunDot.setAttribute("cy", (58 - 58 * Math.sin(angle)).toFixed(1));
+  document.getElementById("sim-arc-done").style.strokeDashoffset = String(183 * (1 - progress));
+  document.querySelector(".sun-arc").classList.toggle("night", x <= 0 || x >= 1);
+
+  const play = document.getElementById("sim-play");
+  play.classList.toggle("paused", !sim.playing);
+  play.setAttribute("aria-label", sim.playing ? "Pausar" : "Reanudar");
+
+  const m = simModel(sim.t);
+  const p = sim.params;
+  const power = formatPower(m.v * m.i);
+  const ideal = formatPower(m.pIdeal);
+  const parts = [
+    ["calor", 1 - m.kTemp],
+    ["poca luz", 1 - m.kLow],
+    ["suciedad", p.dirt / 100],
+    ["sombra", 1 - m.kShade],
+    ["celda", 1 - m.kCell],
+  ].filter(([, loss]) => loss > 0.005);
+  const lossTotal = m.pIdeal > 0.5 ? 1 - (m.v * m.i) / m.pIdeal : null;
+  const items = [
+    ["Luz en las celdas", `${fmt(m.geff, 0)} W/m²`, p.dirt ? `${fmt(m.ghi, 0)} W/m² antes de la suciedad` : "Lo que atraviesa el vidrio"],
+    ["Temperatura de celda", `${fmt(m.tc, 1)} °C`, `${fmt(m.tc - m.ta, 1)} °C sobre el aire`],
+    ["Potencia", `${power.value} ${power.unit}`, m.pIdeal > 0.5 ? `de ${ideal.value} ${ideal.unit} posibles` : "Sin sol"],
+    ["Pérdidas", lossTotal == null ? "—" : `${fmt(Math.max(0, lossTotal) * 100, 0)} %`,
+      parts.length && lossTotal != null ? parts.map(([name, loss]) => `${name} ${fmt(loss * 100, 0)} %`).join(" · ") : "Nada que perder"],
+  ];
+  document.getElementById("sim-readout").replaceChildren(...items.map(([label, value, note], index) => {
+    const el = document.createElement("div");
+    const a = document.createElement("span");
+    a.textContent = label;
+    const b = document.createElement("strong");
+    b.textContent = value;
+    if (index === 3 && lossTotal != null && lossTotal > 0.25) b.className = "loss";
+    const c = document.createElement("small");
+    c.textContent = note;
+    el.append(a, b, c);
+    return el;
+  }));
+}
+
+function bindSim() {
+  document.getElementById("btn-sim").addEventListener("click", () => (sim.active ? stopSim() : startSim()));
+  document.getElementById("btn-thermal-sim").addEventListener("click", startSim);
+  document.getElementById("sim-close").addEventListener("click", stopSim);
+
+  document.getElementById("sim-play").addEventListener("click", () => {
+    if (!sim.playing && sim.t >= simDayAt(SIM_LAST_MIN)) {
+      sim.readings = [];
+      simAdvanceTo(simDayAt(6 * 60));
+    }
+    sim.playing = !sim.playing;
+    simRefresh();
+  });
+
+  const hour = document.getElementById("sim-hour");
+  hour.addEventListener("input", () => {
+    sim.dragging = true;
+    simAdvanceTo(simDayAt(Number(hour.value)));
+    simRefresh();
+  });
+  hour.addEventListener("change", () => {
+    sim.dragging = false;
+  });
+
+  document.querySelectorAll("[data-speed]").forEach((button) => {
+    button.addEventListener("click", () => {
+      sim.speed = Number(button.dataset.speed);
+      syncSimControls();
+    });
+  });
+
+  // Cualquier cambio de condiciones se ve al instante en la lectura actual
+  const applyNow = () => {
+    simAdvanceTo(sim.t);
+    simRefresh();
+  };
+  SIM_SLIDERS.forEach(([key, label]) => {
+    const input = document.getElementById(`sim-${key}`);
+    input.addEventListener("input", () => {
+      sim.params[key] = Number(input.value);
+      document.getElementById(`out-${key}`).textContent = label(sim.params[key]);
+      setFill(input);
+      applyNow();
+    });
+  });
+  ["shade", "hotspot"].forEach((key) => {
+    document.getElementById(`sim-${key}`).addEventListener("change", (event) => {
+      sim.params[key] = event.target.checked;
+      applyNow();
+    });
+  });
+  document.querySelectorAll("[data-preset]").forEach((button) => {
+    button.addEventListener("click", () => {
+      sim.params = { ...SIM_PRESETS[button.dataset.preset] };
+      syncSimControls();
+      applyNow();
+    });
+  });
+}
+
+// ---------- Historial en la nube (Supabase) ----------
+// El ESP32 guarda cada lectura con registrar(); aquí solo se lee. historial() devuelve
+// promedios por tramo (máx. ~900 puntos) y el export baja las filas originales.
+const cloud = { readings: [], range: null, loading: false, error: null, frame: null };
+
+function cloudActive() {
+  const s = state.settings;
+  return !!(s.sbUrl && s.sbKey && s.sbDevice);
+}
+
+function defaultDevice(topic) {
+  const parts = String(topic || "").split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
+}
+
+function resetCloud() {
+  cloud.readings = [];
+  cloud.range = null;
+  cloud.error = null;
+  cloud.frame = null;
+}
+
+async function sbRequest(path, options = {}) {
+  const key = state.settings.sbKey;
+  const headers = { apikey: key, "Content-Type": "application/json" };
+  // Las claves antiguas (JWT) van también como Bearer; las sb_publishable_ no
+  if (key.startsWith("eyJ")) headers.Authorization = `Bearer ${key}`;
+  const response = await fetch(`${state.settings.sbUrl}${path}`, { ...options, headers });
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const body = await response.json();
+      detail = body.message || body.error || "";
+    } catch {
+      detail = "";
+    }
+    throw new Error(detail || `Supabase respondió ${response.status}`);
+  }
+  return response.json();
+}
+
+function rangeStart(key, now = Date.now()) {
+  if (key === "all") return null;
+  if (key === "today") return startOfDay(now);
+  if (key === "48h") return now - 48 * 3600000;
+  return now - 7 * 86400000;
+}
+
+async function loadCloud() {
+  if (!cloudActive() || cloud.loading) return;
+  const range = viewRange();
+  cloud.loading = true;
+  try {
+    const desde = rangeStart(range);
+    const rows = await sbRequest("/rest/v1/rpc/historial", {
+      method: "POST",
+      body: JSON.stringify({
+        p_dispositivo: state.settings.sbDevice,
+        p_desde: desde == null ? null : new Date(desde).toISOString(),
+        p_hasta: new Date().toISOString(),
+        p_puntos: 900,
+      }),
+    });
+    const history = rows
+      .map((r) => coerceReading({ t: Date.parse(r.t), v: r.voltaje, i: r.corriente, irr: r.irradiancia, tp: r.temp_panel, ta: r.temp_ambiente }))
+      .filter(Boolean);
+    const lastT = history.length ? history[history.length - 1].t : 0;
+    cloud.readings = [...history, ...cloud.readings.filter((r) => r.live && r.t > lastT)];
+    cloud.error = null;
+    if (!cloud.frame) loadCloudFrame();
+  } catch (error) {
+    cloud.error = error.message || "error desconocido";
+  } finally {
+    // Aunque falle se marca el rango para no reintentar en cada render; el temporizador reintenta
+    cloud.range = range;
+    cloud.loading = false;
+  }
+  render();
+}
+
+async function loadCloudFrame() {
+  try {
+    const device = encodeURIComponent(state.settings.sbDevice);
+    const rows = await sbRequest(`/rest/v1/termicas?select=creado,ancho,alto,datos&dispositivo=eq.${device}&order=creado.desc&limit=1`);
+    if (!rows.length) return;
+    const frame = parseThermal({ w: rows[0].ancho, h: rows[0].alto, scale: 10, data: rows[0].datos });
+    if (!frame) return;
+    frame.at = Date.parse(rows[0].creado);
+    frame.saved = true;
+    cloud.frame = frame;
+    renderThermal();
+  } catch {
+    // Sin imagen guardada el tablero sigue funcionando
+  }
+}
+
+// Las lecturas en vivo se suman al final del historial: una por cada 15 s, como las que guarda el ESP32
+function pushCloudLive(reading) {
+  const list = cloud.readings;
+  const last = list[list.length - 1];
+  if (last && last.live && reading.t - last.liveStart < 15000) {
+    list[list.length - 1] = { ...reading, live: true, liveStart: last.liveStart };
+  } else if (!last || reading.t > last.t) {
+    list.push({ ...reading, live: true, liveStart: reading.t });
+  }
+}
+
+async function exportCloudCSV() {
+  const device = state.settings.sbDevice;
+  const desde = rangeStart(viewRange());
+  const cols = "creado,voltaje,corriente,potencia,irradiancia,luz_pct,temp_ambiente,temp_panel,panel_min,panel_max,rssi";
+  const filter = `dispositivo=eq.${encodeURIComponent(device)}${desde == null ? "" : `&creado=gte.${encodeURIComponent(new Date(desde).toISOString())}`}`;
+  toast("Descargando el registro completo desde Supabase…");
+  const rows = [];
+  for (let offset = 0; ; offset += 1000) {
+    const page = await sbRequest(`/rest/v1/lecturas?select=${cols}&${filter}&order=creado.asc&limit=1000&offset=${offset}`);
+    rows.push(...page);
+    if (page.length < 1000) break;
+  }
+  if (!rows.length) {
+    toast("No hay lecturas guardadas en este periodo.");
+    return;
+  }
+  const header = "fecha,voltaje_V,corriente_A,potencia_W,irradiancia_Wm2,luz_pct,temp_ambiente_C,temp_panel_C,panel_min_C,panel_max_C,rssi_dBm";
+  const lines = rows.map((row) => cols.split(",").map((col) => row[col] ?? "").join(","));
+  const stamp = new Date().toISOString().slice(0, 10);
+  download(`registro-${device}-${rangeTitle(viewRange()).toLowerCase().replace(/\s+/g, "-")}-${stamp}.csv`, `﻿${header}\n${lines.join("\n")}\n`);
+  toast(`Exporté ${rows.length.toLocaleString("es-MX")} lecturas de Supabase.`);
+}
+
+function connectMqtt() {
+  if (mqttClient) {
+    mqttClient.end(true);
+    mqttClient = null;
+  }
+  const { mqttUrl, mqttTopic, mqttUser, mqttPass } = state.settings;
+  if (!mqttUrl || !mqttTopic) {
+    mqttState = "off";
+    renderStatus();
+    return;
+  }
+  if (!window.mqtt) {
+    mqttState = "error";
+    renderStatus();
+    toast("No cargó la librería MQTT. Revisa la conexión a internet.");
+    return;
+  }
+  mqttState = "connecting";
+  renderStatus();
+  const client = window.mqtt.connect(mqttUrl, {
+    clientId: `tablero-${Math.random().toString(16).slice(2, 10)}`,
+    username: mqttUser || undefined,
+    password: mqttPass || undefined,
+    reconnectPeriod: 5000,
+    connectTimeout: 10000,
+    clean: true,
+  });
+  mqttClient = client;
+  client.on("connect", () => {
+    if (client !== mqttClient) return;
+    client.subscribe([`${mqttTopic}/datos`, `${mqttTopic}/termica`, `${mqttTopic}/estado`]);
+    if (mqttState !== "ok") mqttState = "waiting";
+    renderStatus();
+  });
+  client.on("reconnect", () => {
+    if (client !== mqttClient) return;
+    mqttState = "connecting";
+    renderStatus();
+  });
+  client.on("error", () => {
+    if (client !== mqttClient) return;
+    mqttState = "error";
+    renderStatus();
+  });
+  client.on("message", (topic, payload) => {
+    if (client !== mqttClient) return;
+    handleMqtt(topic.slice(mqttTopic.length + 1), new TextDecoder().decode(payload));
+  });
+}
+
+function handleMqtt(kind, text) {
+  if (kind === "estado") {
+    if (text.trim() === "offline") mqttState = "offline";
+    else if (mqttState !== "ok") mqttState = "waiting";
+    renderStatus();
+    return;
+  }
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return;
+  }
+  lastMqttData = Date.now();
+  mqttState = "ok";
+  if (kind === "termica") {
+    thermalFrame = parseThermal(data) || thermalFrame;
+    renderThermal();
+    renderStatus();
+    return;
+  }
+  if (kind === "datos") {
+    const reading = readingFromPayload(data, Date.now());
+    if (reading) ingestLive(reading);
+    renderStatus();
+  }
+}
+
+// Un punto por intervalo: dentro de la ventana se actualiza el último,
+// así los KPI van en vivo sin llenar el almacenamiento
+function ingestLive(reading) {
+  const replaced = beginRealLog();
+  const last = state.readings[state.readings.length - 1];
+  const windowMs = state.settings.interval * 1000;
+  if (!replaced && last && last.t === liveT && reading.t - lastCommitT < windowMs) {
+    state.readings[state.readings.length - 1] = reading;
+    liveT = reading.t;
+  } else {
+    upsertReading(reading);
+    liveT = reading.t;
+    lastCommitT = reading.t;
+    saveState();
+  }
+  state.mode = "real";
+  if (cloudActive()) pushCloudLive(reading);
+  render();
+  if (replaced) toast("Llegó el ESP32 por MQTT. Quité la simulación y seguí con datos reales.");
+}
+
+function parseThermal(data) {
+  const w = Number(data.w) || 32;
+  const h = Number(data.h) || 24;
+  const scale = Number(data.scale) || 1;
+  const raw = Array.isArray(data.data) ? data.data : [];
+  if (raw.length !== w * h) return null;
+  const temps = raw.map((value) => Number(value) / scale);
+  return { w, h, temps, ...thermalStats(temps), at: Date.now() };
+}
+
+// El percentil 75 representa la temperatura típica del panel aunque haya algo de fondo;
+// el punto caliente se compara contra ella
+function thermalStats(temps) {
+  let lo = Infinity;
+  let hi = -Infinity;
+  let hot = 0;
+  let sum = 0;
+  temps.forEach((t, index) => {
+    if (t < lo) lo = t;
+    if (t > hi) {
+      hi = t;
+      hot = index;
+    }
+    sum += t;
+  });
+  const sorted = [...temps].sort((a, b) => a - b);
+  return { lo, hi, hot, avg: sum / temps.length, ref: sorted[Math.floor(sorted.length * 0.75)] };
+}
+
+const THERMAL_STOPS = [[0, 0, 4], [59, 15, 112], [140, 41, 129], [222, 73, 104], [254, 159, 109], [252, 253, 191]];
+const THERMAL_LUT = Array.from({ length: 256 }, (_, k) => {
+  const x = (k / 255) * (THERMAL_STOPS.length - 1);
+  const a = THERMAL_STOPS[Math.floor(x)];
+  const b = THERMAL_STOPS[Math.min(THERMAL_STOPS.length - 1, Math.floor(x) + 1)];
+  const f = x - Math.floor(x);
+  return a.map((c, j) => Math.round(c + (b[j] - c) * f));
+});
+
+function renderThermal() {
+  const box = document.querySelector(".thermal-box");
+  box.classList.toggle("mirror", !!state.settings.thermalMirror);
+  document.getElementById("btn-mirror").setAttribute("aria-pressed", state.settings.thermalMirror ? "true" : "false");
+  const frame = sim.active ? sim.frame : (thermalFrame || cloud.frame);
+  const set = (id, value) => { document.getElementById(id).textContent = value; };
+  document.getElementById("thermal-empty").hidden = !!frame;
+  const note = document.getElementById("thermal-note");
+  if (!frame) {
+    set("thermal-meta", state.settings.mqttUrl ? "Esperando la cámara MLX90640" : "Configura MQTT en ajustes para ver la cámara");
+    set("thermal-empty-hint", state.settings.mqttUrl
+      ? "El ESP32 todavía no manda imágenes. Mientras tanto puedes probar el simulador."
+      : "Conecta el ESP32 por MQTT o prueba el simulador.");
+    ["thermal-min", "thermal-max", "thermal-lo", "thermal-avg", "thermal-hi"].forEach((id) => set(id, "—"));
+    note.textContent = "";
+    return;
+  }
+  const canvas = document.getElementById("thermal-canvas");
+  const ctx = canvas.getContext("2d");
+  const small = document.createElement("canvas");
+  small.width = frame.w;
+  small.height = frame.h;
+  const sctx = small.getContext("2d");
+  const image = sctx.createImageData(frame.w, frame.h);
+  const range = Math.max(0.5, frame.hi - frame.lo);
+  frame.temps.forEach((t, index) => {
+    const color = THERMAL_LUT[Math.round(clamp((t - frame.lo) / range, 0, 1) * 255)];
+    image.data.set([color[0], color[1], color[2], 255], index * 4);
+  });
+  sctx.putImageData(image, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(small, 0, 0, canvas.width, canvas.height);
+
+  const delta = frame.hi - frame.ref;
+  // Solo se marca el punto más caliente cuando destaca de verdad; si no, sería ruido
+  if (delta > 5) {
+    const cellW = canvas.width / frame.w;
+    const cellH = canvas.height / frame.h;
+    const hx = ((frame.hot % frame.w) + 0.5) * cellW;
+    const hy = (Math.floor(frame.hot / frame.w) + 0.5) * cellH;
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(hx, hy, cellW * 0.9, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  set("thermal-meta", sim.active
+    ? `Simulada · ${fmtTime.format(frame.at)} · ${frame.w}×${frame.h} px`
+    : frame.saved
+      ? `Última guardada · ${formatWhen(frame.at)} · ${frame.w}×${frame.h} px`
+      : `Actualizada ${fmtClock.format(frame.at)} · ${frame.w}×${frame.h} px`);
+  set("thermal-min", `${fmt(frame.lo, 1)} °C`);
+  set("thermal-max", `${fmt(frame.hi, 1)} °C`);
+  set("thermal-lo", `${fmt(frame.lo, 1)} °C`);
+  set("thermal-avg", `${fmt(frame.avg, 1)} °C`);
+  set("thermal-hi", `${fmt(frame.hi, 1)} °C`);
+  note.classList.toggle("hot", delta > 10);
+  note.textContent = delta > 10
+    ? `El punto marcado está ${fmt(delta, 1)} °C sobre la temperatura típica. Puede ser una celda dañada, suciedad o una sombra parcial.`
+    : `Temperatura pareja: el punto más caliente está ${fmt(delta, 1)} °C sobre la temperatura típica.`;
 }
 
 function bind() {
@@ -1504,6 +2366,27 @@ function bind() {
       toast("La dirección del sensor debe empezar por http:// o https://");
       return;
     }
+    const mqttUrl = document.getElementById("set-mqtt-url").value.trim();
+    const mqttTopic = document.getElementById("set-mqtt-topic").value.trim().replace(/[#+]/g, "").replace(/\/+$/, "");
+    if (mqttUrl && !/^wss?:\/\//i.test(mqttUrl)) {
+      toast("El broker debe empezar por ws:// o wss://");
+      return;
+    }
+    if (mqttUrl && !mqttTopic) {
+      toast("Escribe el tema base, el mismo que TOPIC_BASE en el ESP32.");
+      return;
+    }
+    const sbUrl = document.getElementById("set-sb-url").value.trim().replace(/\/+$/, "");
+    const sbKey = document.getElementById("set-sb-key").value.trim();
+    const sbDevice = document.getElementById("set-sb-device").value.trim();
+    if (sbUrl && !/^https:\/\/[^/]+$/i.test(sbUrl)) {
+      toast("La URL de Supabase debe verse como https://abcdefgh.supabase.co");
+      return;
+    }
+    if (sbUrl && (!sbKey || !sbDevice)) {
+      toast("Para el historial faltan la clave pública y el dispositivo.");
+      return;
+    }
     const area = numFrom(document.getElementById("set-area").value);
     const nextArea = area && area > 0 ? area : 1.7;
     const areaChanged = Math.abs(nextArea - state.settings.area) > 0.0001;
@@ -1513,13 +2396,24 @@ function bind() {
       area: nextArea,
       endpoint,
       interval: clamp(Number(document.getElementById("set-interval").value) || 15, 5, 3600),
+      mqttUrl,
+      mqttTopic,
+      mqttUser: document.getElementById("set-mqtt-user").value.trim(),
+      mqttPass: document.getElementById("set-mqtt-pass").value,
+      thermalMirror: state.settings.thermalMirror,
+      sbUrl,
+      sbKey,
+      sbDevice,
     };
+    resetCloud();
     if (state.mode === "demo" && areaChanged) state.readings = generateDemo(nextArea);
     saveState();
     document.getElementById("dlg-settings").close();
     render();
+    renderThermal();
     applyPoll();
-    toast("Ajustes guardados.");
+    connectMqtt();
+    toast(cloudActive() ? "Ajustes guardados. Cargando el historial de Supabase…" : "Ajustes guardados.");
   });
 
   document.getElementById("btn-test-sensor").addEventListener("click", async () => {
@@ -1581,6 +2475,14 @@ function bind() {
     render();
   });
 
+  document.getElementById("btn-mirror").addEventListener("click", () => {
+    state.settings.thermalMirror = !state.settings.thermalMirror;
+    saveState();
+    renderThermal();
+  });
+  window.addEventListener("pagehide", saveState);
+  bindSim();
+
   ["dlg-reading", "dlg-settings"].forEach((id) => {
     const dialog = document.getElementById(id);
     dialog.addEventListener("click", (event) => {
@@ -1610,7 +2512,23 @@ function init() {
   charts.main = new SolarChart(document.getElementById("chart-main"));
   bind();
   render();
+  renderThermal();
   applyPoll();
+  connectMqtt();
+  // index.html#simulador abre el simulador directo, útil para presentaciones
+  if (location.hash === "#simulador") startSim();
+  // El historial en la nube se refresca cada minuto con lo que el ESP32 haya guardado
+  setInterval(() => {
+    if (!cloudActive() || sim.active) return;
+    cloud.range = null;
+    loadCloud();
+  }, 60000);
+  setInterval(() => {
+    if (mqttState === "ok" && Date.now() - lastMqttData > 20000) {
+      mqttState = "stale";
+      renderStatus();
+    }
+  }, 5000);
   window.ObservatorioSolar = {
     ingest(payload) {
       const list = Array.isArray(payload) ? payload : [payload];

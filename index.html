@@ -35,11 +35,90 @@
         <button type="button" class="primary" id="btn-add">Registrar medición</button>
         <button type="button" id="btn-import">Importar CSV</button>
         <button type="button" id="btn-export">Exportar</button>
+        <button type="button" class="sim-launch" id="btn-sim" aria-pressed="false">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+          Simulador
+        </button>
         <button type="button" id="btn-settings">Ajustes</button>
       </div>
     </header>
 
     <div class="banner" id="banner" hidden></div>
+
+    <section class="sim-panel" id="sim-panel" aria-label="Simulador en vivo" hidden>
+      <header class="sim-head">
+        <div class="sim-intro">
+          <p class="kicker">Simulador en vivo · datos de prueba</p>
+          <h2>Un día de sol, a tu ritmo</h2>
+          <p>Cambia las condiciones y mira cómo responde el panel. Nada de esto entra a tu historial real.</p>
+        </div>
+        <div class="sim-clock" aria-live="polite">
+          <svg class="sun-arc" viewBox="0 0 132 64" aria-hidden="true">
+            <path class="arc-track" d="M8 58 A58 58 0 0 1 124 58" />
+            <path class="arc-done" id="sim-arc-done" d="M8 58 A58 58 0 0 1 124 58" />
+            <line x1="2" y1="58" x2="130" y2="58" />
+            <circle id="sim-sun" cx="8" cy="58" r="6" />
+          </svg>
+          <div>
+            <strong id="sim-time">11:00</strong>
+            <span id="sim-sky">Despejado</span>
+          </div>
+        </div>
+        <button type="button" id="sim-close">Salir del simulador</button>
+      </header>
+
+      <div class="sim-timeline">
+        <button type="button" class="sim-play" id="sim-play" aria-label="Pausar">
+          <svg class="i-pause" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+          <svg class="i-play" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M7 5.5v13a1 1 0 0 0 1.5.86l11-6.5a1 1 0 0 0 0-1.72l-11-6.5A1 1 0 0 0 7 5.5z"/></svg>
+        </button>
+        <label class="sim-hour">
+          <span class="sr">Hora del día simulado</span>
+          <input type="range" id="sim-hour" min="330" max="1230" step="5" value="660" />
+          <span class="sim-hour-ticks" aria-hidden="true"><i style="left:3.33%">06</i><i style="left:23.33%">09</i><i style="left:43.33%">12</i><i style="left:63.33%">15</i><i style="left:83.33%">18</i></span>
+        </label>
+        <div class="span-toggle sim-speed" role="group" aria-label="Velocidad">
+          <button type="button" data-speed="1">Real</button>
+          <button type="button" data-speed="60" class="active">1 min/s</button>
+          <button type="button" data-speed="600">10 min/s</button>
+        </div>
+      </div>
+
+      <div class="sim-grid">
+        <label class="sim-range">
+          <span>Nubosidad <output id="out-cloud">10 %</output></span>
+          <input type="range" id="sim-cloud" min="0" max="100" step="1" value="10" />
+        </label>
+        <label class="sim-range">
+          <span>Temperatura máxima del aire <output id="out-ta">30 °C</output></span>
+          <input type="range" id="sim-ta" min="5" max="45" step="1" value="30" />
+        </label>
+        <label class="sim-range">
+          <span>Suciedad del vidrio <output id="out-dirt">0 %</output></span>
+          <input type="range" id="sim-dirt" min="0" max="40" step="1" value="0" />
+        </label>
+        <label class="sim-range">
+          <span>Viento <output id="out-wind">1.5 m/s</output></span>
+          <input type="range" id="sim-wind" min="0" max="12" step="0.5" value="1.5" />
+        </label>
+      </div>
+
+      <div class="sim-foot">
+        <div class="sim-chips">
+          <label class="chip"><input type="checkbox" id="sim-shade" /> Sombra parcial</label>
+          <label class="chip"><input type="checkbox" id="sim-hotspot" /> Celda dañada</label>
+        </div>
+        <div class="sim-presets">
+          <span>Escenarios</span>
+          <button type="button" data-preset="clear">Despejado</button>
+          <button type="button" data-preset="cloudy">Nublado</button>
+          <button type="button" data-preset="heat">Ola de calor</button>
+          <button type="button" data-preset="dirty">Panel descuidado</button>
+        </div>
+      </div>
+
+      <div class="sim-readout" id="sim-readout"></div>
+    </section>
 
     <div class="section-label">
       <h2>Última lectura</h2>
@@ -136,6 +215,10 @@
         </header>
         <p class="energy-value"><span id="kpi-e">—</span> <small id="unit-e">kWh</small></p>
         <p class="energy-sub" id="energy-sub">Energía estimada del periodo</p>
+        <div class="energy-bars-wrap">
+          <p class="energy-bars-caption" id="energy-bars-caption">Energía por día</p>
+          <div class="energy-bars" id="energy-bars"></div>
+        </div>
         <div class="energy-split">
           <div>
             <span>Potencia actual</span>
@@ -149,7 +232,7 @@
       </aside>
     </section>
 
-    <section class="layout">
+    <section class="layout with-thermal">
       <article class="card insights">
         <div class="card-head">
           <div>
@@ -158,6 +241,37 @@
           </div>
         </div>
         <ol id="insights"></ol>
+        <div class="vitals" id="vitals" aria-label="Indicadores del panel"></div>
+      </article>
+
+      <article class="card thermal">
+        <div class="card-head">
+          <div>
+            <h2>Cámara térmica</h2>
+            <p id="thermal-meta">Esperando la cámara MLX90640</p>
+          </div>
+          <button type="button" id="btn-mirror" aria-pressed="false">Espejo</button>
+        </div>
+        <div class="thermal-box">
+          <canvas id="thermal-canvas" width="320" height="240" aria-label="Mapa térmico del panel"></canvas>
+          <div class="thermal-empty" id="thermal-empty">
+            <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="18" height="13" rx="2.5"/><circle cx="12" cy="12.5" r="3.5"/><path d="M8.5 6l1.2-2h4.6l1.2 2"/></svg>
+            <p>Sin imagen todavía</p>
+            <span id="thermal-empty-hint">Conecta el ESP32 por MQTT o prueba el simulador.</span>
+            <button type="button" id="btn-thermal-sim">Abrir simulador</button>
+          </div>
+        </div>
+        <div class="thermal-scale">
+          <span id="thermal-min">—</span>
+          <i aria-hidden="true"></i>
+          <span id="thermal-max">—</span>
+        </div>
+        <div class="thermal-stats">
+          <div><span>Mínima</span><strong id="thermal-lo">—</strong></div>
+          <div><span>Promedio</span><strong id="thermal-avg">—</strong></div>
+          <div><span>Máxima</span><strong id="thermal-hi">—</strong></div>
+        </div>
+        <p class="help" id="thermal-note"></p>
       </article>
 
       <article class="card span-2">
@@ -191,7 +305,7 @@
 
     <footer class="foot">
       <span id="foot-count"></span>
-      <span>Las lecturas se guardan en este navegador. Exporta un CSV para no perderlas.</span>
+      <span id="foot-note">Las lecturas se guardan en este navegador. Exporta un CSV para no perderlas.</span>
     </footer>
   </div>
 
@@ -258,6 +372,37 @@
       <label>Dirección del sensor (opcional)
         <input id="set-endpoint" type="url" placeholder="http://192.168.1.50/data" />
       </label>
+      <fieldset class="mqtt-set">
+        <legend>MQTT</legend>
+        <label>Broker (WebSocket)
+          <input id="set-mqtt-url" type="text" placeholder="wss://broker.hivemq.com:8884/mqtt" />
+        </label>
+        <label>Tema base
+          <input id="set-mqtt-topic" type="text" placeholder="observatorio-solar/panel-01" />
+        </label>
+        <div class="grid-2">
+          <label>Usuario (opcional)
+            <input id="set-mqtt-user" type="text" autocomplete="off" />
+          </label>
+          <label>Contraseña (opcional)
+            <input id="set-mqtt-pass" type="password" autocomplete="off" />
+          </label>
+        </div>
+        <p class="help">El ESP32 publica en <code>&lt;tema&gt;/datos</code>, <code>&lt;tema&gt;/termica</code> y <code>&lt;tema&gt;/estado</code>. El tema base debe ser el mismo que <code>TOPIC_BASE</code> en el firmware. Si abres el tablero por https, el broker debe ser wss://. Se guarda una lectura por cada intervalo del sensor.</p>
+      </fieldset>
+      <fieldset class="mqtt-set">
+        <legend>Historial en la nube (Supabase)</legend>
+        <label>URL del proyecto
+          <input id="set-sb-url" type="text" placeholder="https://abcdefgh.supabase.co" />
+        </label>
+        <label>Clave pública (anon o publishable)
+          <input id="set-sb-key" type="text" autocomplete="off" spellcheck="false" placeholder="sb_publishable_…" />
+        </label>
+        <label>Dispositivo
+          <input id="set-sb-device" type="text" placeholder="panel-k9m4" />
+        </label>
+        <p class="help">Con esto el tablero lee el historial completo que guarda el ESP32, igual en cualquier navegador. Usa solo la clave pública: nunca la <code>service_role</code> ni la contraseña de la base de datos.</p>
+      </fieldset>
       <p class="help">El sensor puede responder con JSON: voltage, current, irradiance, temp_panel, temp_ambient, humidity y wind. También sirven voltaje, corriente, radiacion, temperatura, temp_ambiente, humedad y viento. Si al abrir el archivo directo el navegador bloquea la petición, sirve esta carpeta con un servidor local.</p>
       <footer class="dlg-actions">
         <button type="button" id="btn-test-sensor">Probar sensor</button>
@@ -274,6 +419,7 @@
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <input type="file" id="file-csv" accept=".csv,text/csv,text/plain" hidden />
+  <script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>
